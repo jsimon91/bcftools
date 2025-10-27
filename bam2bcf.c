@@ -141,56 +141,89 @@ static int get_aux_nm(const bam_pileup1_t *p, int32_t qpos, int is_ref)
 }
 
 // position in the sequence with respect to the aligned part of the read
-static int get_position(const bam_pileup1_t *p, int *len,
-                        int *sc_len, int *sc_dist) {
-    int i, j, edist = p->qpos + 1;
+static int get_position(const bam_pileup1_t *p, int *len, int *sc_len,
+                        int *sc_dist)
+{
+    const bam1_t *b = p->b;
+    const int qpos = p->qpos;
+    const int lqs = b->core.l_qseq;
+    uint32_t *cig = bam_get_cigar(b);
+    int ncig = b->core.n_cigar;
+
     int sc_left = 0, sc_right = 0;
     int sc_left_dist = -1, sc_right_dist = -1;
 
-    // left end
-    for (i = 0; i < p->b->core.n_cigar; i++) {
-        int cig  = bam_get_cigar(p->b)[i] & BAM_CIGAR_MASK;
-        if (cig == BAM_CHARD_CLIP)
+    int i = 0;
+    while (i < ncig) {
+        int op = bam_cigar_op(cig[i]);
+        int opl = bam_cigar_oplen(cig[i]);
+        if (op == BAM_CHARD_CLIP) {
+            i++;
             continue;
-        else if (cig == BAM_CSOFT_CLIP)
-            sc_left += bam_get_cigar(p->b)[i] >> BAM_CIGAR_SHIFT;
-        else
-            break;
-    }
-    if (sc_left)
-        sc_left_dist = p->qpos+1 - sc_left;
-    edist -= sc_left;
-
-    // right end
-    for (j = p->b->core.n_cigar-1; j >= i; j--) {
-        int cig  = bam_get_cigar(p->b)[j] & BAM_CIGAR_MASK;
-        if (cig == BAM_CHARD_CLIP)
-            continue;
-        else if (cig == BAM_CSOFT_CLIP)
-            sc_right += bam_get_cigar(p->b)[j] >> BAM_CIGAR_SHIFT;
-        else
-            break;
-    }
-    if (sc_right)
-        sc_right_dist = p->b->core.l_qseq - sc_right - p->qpos;
-
-    // Distance to nearest soft-clips and length of that clip.
-    if (sc_left_dist >= 0) {
-        if (sc_right_dist < 0 || sc_left_dist < sc_right_dist) {
-            *sc_len  = sc_left;
-            *sc_dist = sc_left_dist;
         }
+        if (op == BAM_CSOFT_CLIP) {
+            sc_left += opl;
+            i++;
+        } else {
+            break;
+        }
+    }
+
+    int j = ncig - 1;
+    while (j >= i) {
+        int op = bam_cigar_op(cig[j]);
+        int opl = bam_cigar_oplen(cig[j]);
+        if (op == BAM_CHARD_CLIP) {
+            j--;
+            continue;
+        }
+        if (op == BAM_CSOFT_CLIP) {
+            sc_right += opl;
+            j--;
+        } else {
+            break;
+        }
+    }
+
+    int aligned_len = lqs - sc_left - sc_right;
+    if (aligned_len < 0) {
+        aligned_len = 0;
+    }
+
+    // NB: symmetric (allows zeros)
+    if (sc_left > 0) {
+        int first_aln = sc_left;
+        sc_left_dist = qpos - first_aln;
+    }
+    if (sc_right > 0) {
+        int last_aln = lqs - sc_right - 1; //
+        sc_right_dist = last_aln - qpos;
+    }
+
+    if (sc_left_dist >= 0 &&
+        (sc_right_dist < 0 || sc_left_dist <= sc_right_dist)) {
+        *sc_len = sc_left;
+        *sc_dist = sc_left_dist < 0 ? 0 : sc_left_dist;
     } else if (sc_right_dist >= 0) {
-        *sc_len  = sc_right;
-        *sc_dist = sc_right_dist;
+        *sc_len = sc_right;
+        *sc_dist = sc_right_dist < 0 ? 0 : sc_right_dist;
     } else {
-        *sc_len  = 0;
+        *sc_len = 0;
         *sc_dist = 0;
     }
 
-    *len = p->b->core.l_qseq - sc_left - sc_right;
+    int edist = qpos + 1 - sc_left;
+    if (edist < 1) {
+        edist = 1;
+    }
+    if (edist > aligned_len) {
+        edist = aligned_len;
+    }
+
+    *len = aligned_len;
     return edist;
 }
+
 
 void bcf_callaux_clean(bcf_callaux_t *bca, bcf_call_t *call)
 {
@@ -490,6 +523,7 @@ int bcf_call_glfgen(int _n, const bam_pileup1_t *pl, int ref_base, bcf_callaux_t
         int len, epos = 0, sc_len = 0, sc_dist = 0;
         if ( bca->fmt_flag & (B2B_INFO_RPBZ|B2B_INFO_VDB|B2B_INFO_SCBZ) )
         {
+            // note changes to get_position(), check the following
             int pos = get_position(p, &len, &sc_len, &sc_dist);
             epos = (double)pos/(len+1) * (bca->npos - 1);
             if (sc_len) {
